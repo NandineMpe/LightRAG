@@ -1126,24 +1126,27 @@ def create_document_routes(
 
             # Create document request entry for frontend display
             try:
-                from lightrag.api.routers.document_request_routes import document_requests_db, get_current_timestamp
+                from lightrag.api.routers.document_request_routes import get_current_timestamp
+                from lightrag.kg.shared_storage import get_namespace_data, get_storage_lock
                 import uuid
                 
                 request_id = str(uuid.uuid4())
-                document_requests_db[request_id] = {
-                    "requestId": request_id,
-                    "status": "Processing",
-                    "documentType": request.metadata.get("document_type", "n8n_upload") if request.metadata else "n8n_upload",
-                    "parameters": request.metadata,
-                    "downloadUrl": None,
-                    "fileName": f"{source_identifier}.{request.content_type}",
-                    "fileSize": len(request.content),
-                    "errorMessage": None,
-                    "createdAt": get_current_timestamp(),
-                    "updatedAt": get_current_timestamp(),
-                    "file_content": request.content.encode('utf-8'),  # Store actual content for download
-                    "lightrag_source_id": source_identifier  # Link to LightRAG document
-                }
+                db = await get_namespace_data("document_requests")
+                async with get_storage_lock():
+                    db[request_id] = {
+                        "requestId": request_id,
+                        "status": "Processing",
+                        "documentType": request.metadata.get("document_type", "n8n_upload") if request.metadata else "n8n_upload",
+                        "parameters": request.metadata,
+                        "downloadUrl": None,
+                        "fileName": f"{source_identifier}.{request.content_type}",
+                        "fileSize": len(request.content),
+                        "errorMessage": None,
+                        "createdAt": get_current_timestamp(),
+                        "updatedAt": get_current_timestamp(),
+                        "file_content": request.content.encode('utf-8'),  # Store actual content for download
+                        "lightrag_source_id": source_identifier  # Link to LightRAG document
+                    }
                 
                 # Add background task to monitor LightRAG processing
                 async def monitor_lightrag_processing():
@@ -1160,12 +1163,14 @@ def create_document_routes(
                             for doc_id, doc_status in docs_by_status.items():
                                 if doc_status.file_path == source_identifier:
                                     # Document is processed successfully
-                                    if request_id in document_requests_db:
-                                        document_requests_db[request_id].update({
-                                            "status": "Ready",
-                                            "updatedAt": get_current_timestamp(),
-                                            "downloadUrl": f"/webhook/api/document-requests/{request_id}/download"
-                                        })
+                                    db_inner = await get_namespace_data("document_requests")
+                                    if request_id in db_inner:
+                                        async with get_storage_lock():
+                                            db_inner[request_id].update({
+                                                "status": "Ready",
+                                                "updatedAt": get_current_timestamp(),
+                                                "downloadUrl": f"/webhook/api/document-requests/{request_id}/download"
+                                            })
                                     return
                             
                             # Check for failed documents
@@ -1173,12 +1178,14 @@ def create_document_routes(
                             for doc_id, doc_status in failed_docs.items():
                                 if doc_status.file_path == source_identifier:
                                     # Document processing failed
-                                    if request_id in document_requests_db:
-                                        document_requests_db[request_id].update({
-                                            "status": "Failed",
-                                            "errorMessage": doc_status.error or "Processing failed",
-                                            "updatedAt": get_current_timestamp()
-                                        })
+                                    db_inner = await get_namespace_data("document_requests")
+                                    if request_id in db_inner:
+                                        async with get_storage_lock():
+                                            db_inner[request_id].update({
+                                                "status": "Failed",
+                                                "errorMessage": doc_status.error or "Processing failed",
+                                                "updatedAt": get_current_timestamp()
+                                            })
                                     return
                             
                             # Still processing, wait and try again
@@ -1191,12 +1198,14 @@ def create_document_routes(
                             attempts += 1
                     
                     # Timeout - mark as failed
-                    if request_id in document_requests_db:
-                        document_requests_db[request_id].update({
-                            "status": "Failed",
-                            "errorMessage": "Processing timeout after 5 minutes",
-                            "updatedAt": get_current_timestamp()
-                        })
+                    db_inner = await get_namespace_data("document_requests")
+                    if request_id in db_inner:
+                        async with get_storage_lock():
+                            db_inner[request_id].update({
+                                "status": "Failed",
+                                "errorMessage": "Processing timeout after 5 minutes",
+                                "updatedAt": get_current_timestamp()
+                            })
                 
                 background_tasks.add_task(monitor_lightrag_processing)
                 

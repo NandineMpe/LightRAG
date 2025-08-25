@@ -21,9 +21,10 @@ from pydantic import BaseModel, Field, field_validator
 from lightrag.utils import logger
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.config import global_args
+from lightrag.kg.shared_storage import get_namespace_data, get_storage_lock
 
-# In-memory storage for document requests (in production, use a proper database)
-document_requests_db: Dict[str, Dict[str, Any]] = {}
+# Shared storage namespace for document requests
+DOCUMENT_REQUESTS_NS = "document_requests"
 
 router = APIRouter(
     prefix="/webhook",
@@ -249,16 +250,10 @@ async def handle_binary_file_upload(
 ) -> DocumentRequestResponse:
     """Handle binary file upload via multipart/form-data"""
     try:
+        db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
         # Generate request ID if not provided
         if not request_id:
             request_id = str(uuid.uuid4())
-        
-        # Check if request already exists
-        if request_id in document_requests_db:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Document request with ID {request_id} already exists"
-            )
         
         # Parse parameters if provided
         parsed_parameters = None
@@ -268,20 +263,27 @@ async def handle_binary_file_upload(
             except json.JSONDecodeError:
                 logger.warning(f"Invalid JSON parameters: {parameters}")
         
-        # Create new document request with file info
-        document_requests_db[request_id] = {
-            "requestId": request_id,
-            "status": "Ready",  # File is immediately available
-            "documentType": document_type or "uploaded_file",
-            "parameters": parsed_parameters,
-            "downloadUrl": None,  # File is stored in the request
-            "fileName": file.filename,
-            "fileSize": file.size,
-            "errorMessage": None,
-            "createdAt": get_current_timestamp(),
-            "updatedAt": get_current_timestamp(),
-            "file_content": await file.read()  # Store file content
-        }
+        # Check if request already exists and create new document request with file info
+        async with get_storage_lock():
+            if request_id in db:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Document request with ID {request_id} already exists"
+                )
+            
+            db[request_id] = {
+                "requestId": request_id,
+                "status": "Ready",  # File is immediately available
+                "documentType": document_type or "uploaded_file",
+                "parameters": parsed_parameters,
+                "downloadUrl": None,  # File is stored in the request
+                "fileName": file.filename,
+                "fileSize": file.size,
+                "errorMessage": None,
+                "createdAt": get_current_timestamp(),
+                "updatedAt": get_current_timestamp(),
+                "file_content": await file.read()  # Store file content
+            }
         
         logger.info(f"Binary file uploaded: {request_id}, filename: {file.filename}, size: {file.size}")
         
@@ -302,26 +304,28 @@ async def handle_binary_file_upload(
 async def handle_json_request(request: DocumentRequestWebhookRequest) -> DocumentRequestResponse:
     """Handle JSON format request"""
     try:
+        db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
         request_id = request.requestId
         
         # Check if this is a completion notification (Type B)
         if request.action:
             # Type B: Completion notification
-            if request_id not in document_requests_db:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Document request with ID {request_id} not found"
-                )
-            
-            # Update existing request
-            document_requests_db[request_id].update({
-                "status": "Ready" if request.action == "completed" else "Failed",
-                "downloadUrl": request.downloadUrl,
-                "fileName": request.fileName,
-                "fileSize": request.fileSize,
-                "errorMessage": request.errorMessage,
-                "updatedAt": get_current_timestamp()
-            })
+            async with get_storage_lock():
+                if request_id not in db:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Document request with ID {request_id} not found"
+                    )
+                
+                # Update existing request
+                db[request_id].update({
+                    "status": "Ready" if request.action == "completed" else "Failed",
+                    "downloadUrl": request.downloadUrl,
+                    "fileName": request.fileName,
+                    "fileSize": request.fileSize,
+                    "errorMessage": request.errorMessage,
+                    "updatedAt": get_current_timestamp()
+                })
             
             status_message = "Document processing completed successfully"
             if request.action == "failed":
@@ -337,26 +341,27 @@ async def handle_json_request(request: DocumentRequestWebhookRequest) -> Documen
         
         else:
             # Type A: Initial request
-            # Check if request already exists
-            if request_id in document_requests_db:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Document request with ID {request_id} already exists"
-                )
-            
-            # Create new document request
-            document_requests_db[request_id] = {
-                "requestId": request_id,
-                "status": "Requested",
-                "documentType": request.documentType,
-                "parameters": request.parameters,
-                "downloadUrl": None,
-                "fileName": None,
-                "fileSize": None,
-                "errorMessage": None,
-                "createdAt": get_current_timestamp(),
-                "updatedAt": get_current_timestamp()
-            }
+            async with get_storage_lock():
+                # Check if request already exists
+                if request_id in db:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Document request with ID {request_id} already exists"
+                    )
+                
+                # Create new document request
+                db[request_id] = {
+                    "requestId": request_id,
+                    "status": "Requested",
+                    "documentType": request.documentType,
+                    "parameters": request.parameters,
+                    "downloadUrl": None,
+                    "fileName": None,
+                    "fileSize": None,
+                    "errorMessage": None,
+                    "createdAt": get_current_timestamp(),
+                    "updatedAt": get_current_timestamp()
+                }
             
             logger.info(f"New document request created: {request_id}")
             
@@ -384,24 +389,26 @@ async def handle_form_completion_notification(
 ) -> DocumentRequestResponse:
     """Handle completion notification via form data"""
     try:
+        db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
         if not request_id:
             raise HTTPException(status_code=400, detail="requestId is required")
         
-        if request_id not in document_requests_db:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document request with ID {request_id} not found"
-            )
-        
-        # Update existing request
-        document_requests_db[request_id].update({
-            "status": "Ready" if action == "completed" else "Failed",
-            "downloadUrl": download_url,
-            "fileName": file_name,
-            "fileSize": file_size,
-            "errorMessage": error_message,
-            "updatedAt": get_current_timestamp()
-        })
+        async with get_storage_lock():
+            if request_id not in db:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Document request with ID {request_id} not found"
+                )
+            
+            # Update existing request
+            db[request_id].update({
+                "status": "Ready" if action == "completed" else "Failed",
+                "downloadUrl": download_url,
+                "fileName": file_name,
+                "fileSize": file_size,
+                "errorMessage": error_message,
+                "updatedAt": get_current_timestamp()
+            })
         
         status_message = "Document processing completed successfully"
         if action == "failed":
@@ -430,16 +437,10 @@ async def handle_form_initial_request(
 ) -> DocumentRequestResponse:
     """Handle initial request via form data"""
     try:
+        db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
         # Generate request ID if not provided
         if not request_id:
             request_id = str(uuid.uuid4())
-        
-        # Check if request already exists
-        if request_id in document_requests_db:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Document request with ID {request_id} already exists"
-            )
         
         # Parse parameters if provided
         parsed_parameters = None
@@ -449,19 +450,26 @@ async def handle_form_initial_request(
             except json.JSONDecodeError:
                 logger.warning(f"Invalid JSON parameters: {parameters}")
         
-        # Create new document request
-        document_requests_db[request_id] = {
-            "requestId": request_id,
-            "status": "Requested",
-            "documentType": document_type,
-            "parameters": parsed_parameters,
-            "downloadUrl": None,
-            "fileName": None,
-            "fileSize": None,
-            "errorMessage": None,
-            "createdAt": get_current_timestamp(),
-            "updatedAt": get_current_timestamp()
-        }
+        # Check if request already exists and create new document request
+        async with get_storage_lock():
+            if request_id in db:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Document request with ID {request_id} already exists"
+                )
+            
+            db[request_id] = {
+                "requestId": request_id,
+                "status": "Requested",
+                "documentType": document_type,
+                "parameters": parsed_parameters,
+                "downloadUrl": None,
+                "fileName": None,
+                "fileSize": None,
+                "errorMessage": None,
+                "createdAt": get_current_timestamp(),
+                "updatedAt": get_current_timestamp()
+            }
         
         logger.info(f"New document request created via form: {request_id}")
         
@@ -569,8 +577,9 @@ def create_document_request_routes(api_key: Optional[str] = None):
             DocumentRequestsResponse: List of all document requests ordered by creation date
         """
         try:
+            db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
             # Get all requests and sort by created_at DESC
-            requests = list(document_requests_db.values())
+            requests = list(db.values())
             requests.sort(key=lambda x: x["createdAt"], reverse=True)
             
             # Convert to DocumentRequestStatus objects
@@ -604,13 +613,14 @@ def create_document_request_routes(api_key: Optional[str] = None):
             DocumentRequestStatus: The document request details
         """
         try:
-            if request_id not in document_requests_db:
+            db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
+            if request_id not in db:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Document request with ID {request_id} not found"
                 )
             
-            return DocumentRequestStatus(**document_requests_db[request_id])
+            return DocumentRequestStatus(**db[request_id])
             
         except HTTPException:
             raise
@@ -634,13 +644,14 @@ def create_document_request_routes(api_key: Optional[str] = None):
             StreamingResponse: The binary file content with appropriate headers
         """
         try:
-            if request_id not in document_requests_db:
+            db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
+            if request_id not in db:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Document request with ID {request_id} not found"
                 )
             
-            request_data = document_requests_db[request_id]
+            request_data = db[request_id]
             
             # Check if file content exists
             if "file_content" not in request_data or request_data["file_content"] is None:
@@ -703,13 +714,15 @@ def create_document_request_routes(api_key: Optional[str] = None):
             Success message
         """
         try:
-            if request_id not in document_requests_db:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Document request with ID {request_id} not found"
-                )
-            
-            del document_requests_db[request_id]
+            db = await get_namespace_data(DOCUMENT_REQUESTS_NS)
+            async with get_storage_lock():
+                if request_id not in db:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Document request with ID {request_id} not found"
+                    )
+                
+                del db[request_id]
             logger.info(f"Document request deleted: {request_id}")
             
             return {"status": "success", "message": f"Document request {request_id} deleted successfully"}
